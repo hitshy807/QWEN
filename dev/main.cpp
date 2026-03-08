@@ -1,425 +1,96 @@
-/*
- * Qwen3.5 OCR GUI - Native llama.cpp Integration
- *
- * Flow:
- *   1. Browse Image -> auto blob crop + bilinear 1/2 resize -> show preview
- *   2. Load Model -> loads model + vision encoder directly (no server)
- *   3. OCR -> native GPU inference, no HTTP overhead
- *
- * Dependencies: Windows SDK, llama.cpp (llama.dll, mtmd.dll, ggml*.dll)
- */
+// Qwen3.5 OCR GUI - ImGui + DirectX11 Modern Dashboard
 #define NOMINMAX
-#define LLAMA_SHARED
 #include <windows.h>
-#include <objidl.h>
-#include <commdlg.h>
-#include <gdiplus.h>
-#include <commctrl.h>
+#include <dwmapi.h>
+#include <d3d11.h>
+#include <tchar.h>
 #include <string>
-#include <vector>
 #include <thread>
-#include <chrono>
-#include <algorithm>
+#include <mutex>
+#include <gdiplus.h>
+#include <commdlg.h>
 
-#include "llama.h"
-#include "mtmd.h"
-#include "mtmd-helper.h"
+#include "imgui.h"
+#include "imgui_impl_win32.h"
+#include "imgui_impl_dx11.h"
 
-#pragma comment(lib, "user32.lib")
-#pragma comment(lib, "gdi32.lib")
-#pragma comment(lib, "gdiplus.lib")
-#pragma comment(lib, "comctl32.lib")
-#pragma comment(lib, "comdlg32.lib")
-#pragma comment(lib, "ole32.lib")
-#pragma comment(linker, "/manifestdependency:\"type='win32' name='Microsoft.Windows.Common-Controls' \
-version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
+#include "ocr_engine.h"
 
-// ===== Constants =====
-static const wchar_t* APP_TITLE = L"Qwen3.5 OCR";
-static const int WIN_W = 1100, WIN_H = 720;
-static const int IMG_X = 15, IMG_Y = 55, IMG_W = 520, IMG_H = 540;
-static const int CTL_X = 555;
-static const int BLOB_THRESHOLD = 180;
-static const int CROP_PADDING = 10;
-static const int MAX_TOKENS = 256;
-
-enum {
-    IDC_MODEL_LOAD = 101, IDC_MODEL_STATUS,
-    IDC_IMAGE_PATH = 111, IDC_IMAGE_BROWSE, IDC_IMAGE_INFO,
-    IDC_OCR_BTN = 121, IDC_OCR_TIME,
-    IDC_RESULT = 131,
-};
-enum { WM_MODEL_READY = WM_APP + 1, WM_MODEL_FAIL, WM_OCR_DONE, WM_OCR_FAIL };
-
-// ===== Global State =====
-static HWND g_hWnd;
-static HWND g_hModelLoad, g_hModelStatus;
-static HWND g_hImagePath, g_hImageBrowse, g_hImageInfo;
-static HWND g_hOcrBtn, g_hOcrTime;
-static HWND g_hResult;
-static HFONT g_hFont, g_hFontBold;
+// Data
+static ID3D11Device*            g_pd3dDevice = nullptr;
+static ID3D11DeviceContext*     g_pd3dDeviceContext = nullptr;
+static IDXGISwapChain*          g_pSwapChain = nullptr;
+static ID3D11RenderTargetView*  g_mainRenderTargetView = nullptr;
 
 static Gdiplus::Bitmap* g_processedImage = nullptr;
+static ID3D11ShaderResourceView* g_pTextureView = nullptr;
+static int g_imgWidth = 0;
+static int g_imgHeight = 0;
+
+static std::string g_imagePathStr;
 static std::wstring g_imagePath;
-static std::string g_ocrResult;
+static std::string g_ocrResult = "Ready.";
 static double g_ocrElapsed = 0;
 
-// llama.cpp state
-static llama_model*    g_model    = nullptr;
-static llama_context*  g_lctx     = nullptr;
-static mtmd_context*   g_mtmd_ctx = nullptr;
-static const llama_vocab* g_vocab = nullptr;
-static bool g_modelLoaded = false;
+static bool g_isModelLoading = false;
+static bool g_isOcrRunning = false;
+static std::mutex g_stateMutex;
 
-// ===== Utility: String Conversion =====
-static std::wstring Utf8ToWide(const std::string& s) {
-    if (s.empty()) return {};
-    int len = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, nullptr, 0);
-    std::wstring ws(len - 1, 0);
-    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, &ws[0], len);
-    return ws;
-}
+// Forward declarations
+bool CreateDeviceD3D(HWND hWnd);
+void CleanupDeviceD3D();
+void CreateRenderTarget();
+void CleanupRenderTarget();
+LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
-static std::string WideToUtf8(const std::wstring& ws) {
-    if (ws.empty()) return {};
-    int len = WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), -1, nullptr, 0, nullptr, nullptr);
-    std::string s(len - 1, 0);
-    WideCharToMultiByte(CP_UTF8, 0, ws.c_str(), -1, &s[0], len, nullptr, nullptr);
-    return s;
-}
+// Utility to create DX11 texture from GDI+ Bitmap
+void LoadTextureFromGdiplus(Gdiplus::Bitmap* bmp, ID3D11Device* d3dDevice, ID3D11ShaderResourceView** out_srv, int* out_width, int* out_height) {
+    if (*out_srv) { (*out_srv)->Release(); *out_srv = nullptr; }
+    if (!bmp || bmp->GetLastStatus() != Gdiplus::Ok) return;
 
-// ===== Image Preprocessing: Blob Crop + Bilinear Resize =====
-static Gdiplus::Bitmap* CropAndResize(const std::wstring& path,
-                                       int& origW, int& origH, int& cropW, int& cropH,
-                                       int& outW, int& outH) {
-    Gdiplus::Bitmap src(path.c_str());
-    if (src.GetLastStatus() != Gdiplus::Ok) return nullptr;
+    UINT width = bmp->GetWidth();
+    UINT height = bmp->GetHeight();
 
-    int w = src.GetWidth(), h = src.GetHeight();
-    origW = w; origH = h;
-
+    Gdiplus::Rect rect(0, 0, width, height);
     Gdiplus::BitmapData bmpData;
-    Gdiplus::Rect rect(0, 0, w, h);
-    if (src.LockBits(&rect, Gdiplus::ImageLockModeRead,
-                      PixelFormat32bppARGB, &bmpData) != Gdiplus::Ok) return nullptr;
+    bmp->LockBits(&rect, Gdiplus::ImageLockModeRead, PixelFormat32bppARGB, &bmpData);
 
-    int minX = w, minY = h, maxX = 0, maxY = 0;
-    for (int y = 0; y < h; y++) {
-        uint8_t* row = (uint8_t*)bmpData.Scan0 + y * bmpData.Stride;
-        for (int x = 0; x < w; x++) {
-            uint8_t b = row[x * 4 + 0];
-            uint8_t g = row[x * 4 + 1];
-            uint8_t r = row[x * 4 + 2];
-            uint8_t gray = (uint8_t)(0.299f * r + 0.587f * g + 0.114f * b);
-            if (gray > BLOB_THRESHOLD) {
-                if (x < minX) minX = x;
-                if (y < minY) minY = y;
-                if (x > maxX) maxX = x;
-                if (y > maxY) maxY = y;
-            }
-        }
+    // Create texture
+    D3D11_TEXTURE2D_DESC desc;
+    ZeroMemory(&desc, sizeof(desc));
+    desc.Width = width;
+    desc.Height = height;
+    desc.MipLevels = 1;
+    desc.ArraySize = 1;
+    desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    desc.SampleDesc.Count = 1;
+    desc.Usage = D3D11_USAGE_DEFAULT;
+    desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    desc.CPUAccessFlags = 0;
+
+    D3D11_SUBRESOURCE_DATA subResource;
+    subResource.pSysMem = bmpData.Scan0;
+    subResource.SysMemPitch = bmpData.Stride;
+    subResource.SysMemSlicePitch = 0;
+
+    ID3D11Texture2D* pTexture = nullptr;
+    d3dDevice->CreateTexture2D(&desc, &subResource, &pTexture);
+    bmp->UnlockBits(&bmpData);
+
+    if (pTexture) {
+        D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc;
+        ZeroMemory(&srvDesc, sizeof(srvDesc));
+        srvDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+        srvDesc.Texture2D.MipLevels = desc.MipLevels;
+        srvDesc.Texture2D.MostDetailedMip = 0;
+        d3dDevice->CreateShaderResourceView(pTexture, &srvDesc, out_srv);
+        pTexture->Release();
     }
-    src.UnlockBits(&bmpData);
-
-    if (maxX <= minX || maxY <= minY) {
-        minX = 0; minY = 0; maxX = w - 1; maxY = h - 1;
-    }
-
-    minX = (std::max)(0, minX - CROP_PADDING);
-    minY = (std::max)(0, minY - CROP_PADDING);
-    maxX = (std::min)(w - 1, maxX + CROP_PADDING);
-    maxY = (std::min)(h - 1, maxY + CROP_PADDING);
-
-    cropW = maxX - minX + 1;
-    cropH = maxY - minY + 1;
-
-    // Bilinear resize to 1/4 area (1/2 each dimension)
-    outW = cropW / 2;
-    outH = cropH / 2;
-    if (outW < 100) { outW = cropW; outH = cropH; }
-
-    auto* result = new Gdiplus::Bitmap(outW, outH, PixelFormat24bppRGB);
-    Gdiplus::Graphics g(result);
-    g.SetInterpolationMode(Gdiplus::InterpolationModeBilinear);
-    Gdiplus::Rect destRect(0, 0, outW, outH);
-    g.DrawImage(&src, destRect, minX, minY, cropW, cropH, Gdiplus::UnitPixel);
-
-    return result;
+    *out_width = width;
+    *out_height = height;
 }
 
-// ===== Extract RGB bytes from GDI+ Bitmap for mtmd =====
-static std::vector<uint8_t> BitmapToRGB(Gdiplus::Bitmap* bmp, uint32_t& w, uint32_t& h) {
-    w = bmp->GetWidth();
-    h = bmp->GetHeight();
-    Gdiplus::BitmapData data;
-    Gdiplus::Rect rect(0, 0, (int)w, (int)h);
-    bmp->LockBits(&rect, Gdiplus::ImageLockModeRead, PixelFormat24bppRGB, &data);
-    std::vector<uint8_t> rgb(w * h * 3);
-    for (uint32_t y = 0; y < h; y++) {
-        uint8_t* row = (uint8_t*)data.Scan0 + y * data.Stride;
-        for (uint32_t x = 0; x < w; x++) {
-            // GDI+ PixelFormat24bppRGB is actually BGR
-            rgb[(y * w + x) * 3 + 0] = row[x * 3 + 2]; // R
-            rgb[(y * w + x) * 3 + 1] = row[x * 3 + 1]; // G
-            rgb[(y * w + x) * 3 + 2] = row[x * 3 + 0]; // B
-        }
-    }
-    bmp->UnlockBits(&data);
-    return rgb;
-}
-
-// ===== File & Path Utilities =====
-static std::wstring GetExeDir() {
-    wchar_t buf[MAX_PATH];
-    GetModuleFileNameW(nullptr, buf, MAX_PATH);
-    std::wstring path(buf);
-    return path.substr(0, path.rfind(L'\\'));
-}
-
-static bool FileExists(const std::wstring& path) {
-    return GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES;
-}
-
-// ===== Free llama resources =====
-static void FreeModel() {
-    g_modelLoaded = false;
-    if (g_mtmd_ctx) { mtmd_free(g_mtmd_ctx); g_mtmd_ctx = nullptr; }
-    if (g_lctx) { llama_free(g_lctx); g_lctx = nullptr; }
-    if (g_model) { llama_model_free(g_model); g_model = nullptr; }
-    g_vocab = nullptr;
-}
-
-// ===== Model Load Thread =====
-static void ModelLoadThread() {
-    std::wstring exeDir = GetExeDir();
-
-    // Search model dirs
-    static const wchar_t* MODEL_FILE = L"Qwen3.5-2B-Q4_K_M.gguf";
-    static const wchar_t* MMPROJ_FILE = L"mmproj-F16.gguf";
-    std::wstring modelDirs[] = {
-        exeDir + L"\\models",
-        exeDir + L"\\..\\models",
-        exeDir + L"\\..\\..\\models",
-    };
-    std::wstring modelPath, mmprojPath;
-    for (auto& dir : modelDirs) {
-        std::wstring m = dir + L"\\" + MODEL_FILE;
-        std::wstring p = dir + L"\\" + MMPROJ_FILE;
-        if (FileExists(m) && FileExists(p)) {
-            modelPath = m; mmprojPath = p; break;
-        }
-    }
-    if (modelPath.empty()) {
-        g_ocrResult = "Model not found. Place Qwen3.5-2B-Q4_K_M.gguf + mmproj-F16.gguf in exe/models/";
-        PostMessage(g_hWnd, WM_MODEL_FAIL, 0, 0);
-        return;
-    }
-
-    FreeModel();
-
-    std::string modelUtf8 = WideToUtf8(modelPath);
-    std::string mmprojUtf8 = WideToUtf8(mmprojPath);
-
-    // Load model
-    llama_model_params mparams = llama_model_default_params();
-    mparams.n_gpu_layers = 99;
-    g_model = llama_model_load_from_file(modelUtf8.c_str(), mparams);
-    if (!g_model) {
-        g_ocrResult = "Failed to load model";
-        PostMessage(g_hWnd, WM_MODEL_FAIL, 0, 0);
-        return;
-    }
-    g_vocab = llama_model_get_vocab(g_model);
-
-    // Create context
-    llama_context_params cparams = llama_context_default_params();
-    cparams.n_ctx = 1536;
-    cparams.n_batch = 1536;
-    cparams.n_threads = (int)std::thread::hardware_concurrency();
-    cparams.n_threads_batch = (int)std::thread::hardware_concurrency();
-    cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
-    cparams.type_k = GGML_TYPE_Q4_0;
-    cparams.type_v = GGML_TYPE_Q4_0;
-    g_lctx = llama_init_from_model(g_model, cparams);
-    if (!g_lctx) {
-        g_ocrResult = "Failed to create context";
-        FreeModel();
-        PostMessage(g_hWnd, WM_MODEL_FAIL, 0, 0);
-        return;
-    }
-
-    // Create multimodal context
-    mtmd_context_params mtparams = mtmd_context_params_default();
-    mtparams.use_gpu = true;
-    mtparams.print_timings = false;
-    mtparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
-    mtparams.n_threads = (int)std::thread::hardware_concurrency();
-    mtparams.warmup = true;
-    g_mtmd_ctx = mtmd_init_from_file(mmprojUtf8.c_str(), g_model, mtparams);
-    if (!g_mtmd_ctx) {
-        g_ocrResult = "Failed to load vision encoder";
-        FreeModel();
-        PostMessage(g_hWnd, WM_MODEL_FAIL, 0, 0);
-        return;
-    }
-
-    // Warmup: dummy decode to pre-compile CUDA kernels
-    {
-        llama_batch wb = llama_batch_init(1, 0, 1);
-        wb.n_tokens = 1;
-        wb.token[0] = 0;
-        wb.pos[0] = 0;
-        wb.n_seq_id[0] = 1;
-        wb.seq_id[0][0] = 0;
-        wb.logits[0] = 0;
-        llama_decode(g_lctx, wb);
-        llama_batch_free(wb);
-        llama_memory_clear(llama_get_memory(g_lctx), true);
-    }
-
-    g_modelLoaded = true;
-    PostMessage(g_hWnd, WM_MODEL_READY, 0, 0);
-}
-
-// ===== OCR Thread =====
-static void OcrThread() {
-    if (!g_processedImage || !g_modelLoaded) {
-        g_ocrResult = "Model or image not ready.";
-        PostMessage(g_hWnd, WM_OCR_FAIL, 0, 0);
-        return;
-    }
-
-    // Extract RGB from processed image
-    uint32_t imgW, imgH;
-    auto rgb = BitmapToRGB(g_processedImage, imgW, imgH);
-
-    // Create mtmd bitmap
-    mtmd_bitmap* bmp = mtmd_bitmap_init(imgW, imgH, rgb.data());
-    if (!bmp) {
-        g_ocrResult = "Failed to create bitmap";
-        PostMessage(g_hWnd, WM_OCR_FAIL, 0, 0);
-        return;
-    }
-
-    // Build prompt: <media_marker>\nOCR instruction
-    const char* marker = mtmd_default_marker();
-    std::string userContent = std::string(marker) +
-        "\nRead every line strictly top to bottom in exact order. "
-        "Include *...* number lines in their exact position between surrounding lines. "
-        "Output text only. /no_think";
-
-    // Apply chat template
-    llama_chat_message msgs[] = {
-        {"user", userContent.c_str()},
-    };
-    const char* tmpl = llama_model_chat_template(g_model, nullptr);
-    int32_t bufLen = llama_chat_apply_template(tmpl, msgs, 1, true, nullptr, 0);
-    if (bufLen < 0) {
-        g_ocrResult = "Failed to apply chat template";
-        mtmd_bitmap_free(bmp);
-        PostMessage(g_hWnd, WM_OCR_FAIL, 0, 0);
-        return;
-    }
-    std::vector<char> buf(bufLen + 1);
-    llama_chat_apply_template(tmpl, msgs, 1, true, buf.data(), (int32_t)buf.size());
-    std::string prompt(buf.data(), bufLen);
-    // Force no-think: pre-fill completed think block
-    prompt += "<think>\n</think>\n";
-
-    // Tokenize with multimodal support
-    mtmd_input_text text;
-    text.text = prompt.c_str();
-    text.add_special = true;
-    text.parse_special = true;
-
-    mtmd_input_chunks* chunks = mtmd_input_chunks_init();
-    const mtmd_bitmap* bitmaps[] = { bmp };
-    int32_t res = mtmd_tokenize(g_mtmd_ctx, chunks, &text, bitmaps, 1);
-    mtmd_bitmap_free(bmp);
-
-    if (res != 0) {
-        g_ocrResult = "Failed to tokenize prompt";
-        mtmd_input_chunks_free(chunks);
-        PostMessage(g_hWnd, WM_OCR_FAIL, 0, 0);
-        return;
-    }
-
-    // Clear KV cache
-    llama_memory_clear(llama_get_memory(g_lctx), true);
-
-    auto t0 = std::chrono::high_resolution_clock::now();
-
-    // Eval all chunks (text + image)
-    llama_pos n_past = 0;
-    llama_pos new_n_past;
-    res = mtmd_helper_eval_chunks(g_mtmd_ctx, g_lctx, chunks,
-        n_past, 0, 1536, true, &new_n_past);
-    mtmd_input_chunks_free(chunks);
-
-    if (res != 0) {
-        g_ocrResult = "Failed to eval prompt";
-        PostMessage(g_hWnd, WM_OCR_FAIL, 0, 0);
-        return;
-    }
-    n_past = new_n_past;
-
-    // Greedy sampler (temperature = 0)
-    auto sparams = llama_sampler_chain_default_params();
-    llama_sampler* smpl = llama_sampler_chain_init(sparams);
-    llama_sampler_chain_add(smpl, llama_sampler_init_greedy());
-
-    // Find </think> token ID to filter thinking output
-    llama_token think_end_id = -1;
-    {
-        llama_token tmp[4];
-        int32_t n = llama_tokenize(g_vocab, "</think>", 8, tmp, 4, false, true);
-        if (n == 1) think_end_id = tmp[0];
-    }
-
-    // Generate tokens
-    std::string result;
-    llama_batch batch = llama_batch_init(1, 0, 1);
-    bool past_think = true; // pre-fill handles think suppression, collect all tokens
-
-    for (int i = 0; i < MAX_TOKENS; i++) {
-        llama_token token_id = llama_sampler_sample(smpl, g_lctx, -1);
-
-        if (llama_vocab_is_eog(g_vocab, token_id)) break;
-
-        // Skip all tokens until after </think>
-        if (!past_think) {
-            if (token_id == think_end_id) past_think = true;
-        } else {
-            char piece[256];
-            int n = llama_token_to_piece(g_vocab, token_id, piece, sizeof(piece), 0, false);
-            if (n > 0) result.append(piece, n);
-        }
-
-        // Decode next token
-        batch.n_tokens = 1;
-        batch.token[0] = token_id;
-        batch.pos[0] = n_past++;
-        batch.n_seq_id[0] = 1;
-        batch.seq_id[0][0] = 0;
-        batch.logits[0] = 1;
-
-        if (llama_decode(g_lctx, batch)) break;
-    }
-
-    llama_batch_free(batch);
-    llama_sampler_free(smpl);
-
-    auto t1 = std::chrono::high_resolution_clock::now();
-    g_ocrElapsed = std::chrono::duration<double>(t1 - t0).count();
-
-    // Trim leading whitespace/newlines
-    while (!result.empty() && (result[0] == '\n' || result[0] == ' ')) result.erase(0, 1);
-
-    g_ocrResult = result.empty() ? "No output generated" : result;
-    PostMessage(g_hWnd, result.empty() ? WM_OCR_FAIL : WM_OCR_DONE, 0, 0);
-}
-
-// ===== File Dialog =====
 static std::wstring BrowseImage(HWND hWnd) {
     wchar_t buf[MAX_PATH] = {};
     OPENFILENAMEW ofn = { sizeof(ofn) };
@@ -431,237 +102,389 @@ static std::wstring BrowseImage(HWND hWnd) {
     return GetOpenFileNameW(&ofn) ? buf : L"";
 }
 
-// ===== GDI+ Image Preview =====
-static void DrawPreview(HDC hdc) {
-    Gdiplus::Graphics g(hdc);
-    g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
-    Gdiplus::Pen pen(Gdiplus::Color(80, 80, 80), 1.5f);
-    g.DrawRectangle(&pen, IMG_X, IMG_Y, IMG_W, IMG_H);
-
-    if (g_processedImage && g_processedImage->GetLastStatus() == Gdiplus::Ok) {
-        int iw = g_processedImage->GetWidth(), ih = g_processedImage->GetHeight();
-        float scale = (std::min)((float)(IMG_W - 10) / iw, (float)(IMG_H - 10) / ih);
-        int dw = (int)(iw * scale), dh = (int)(ih * scale);
-        int dx = IMG_X + (IMG_W - dw) / 2, dy = IMG_Y + (IMG_H - dh) / 2;
-        g.SetInterpolationMode(Gdiplus::InterpolationModeBilinear);
-        g.DrawImage(g_processedImage, dx, dy, dw, dh);
-    } else {
-        Gdiplus::Font font(L"Segoe UI", 18);
-        Gdiplus::SolidBrush brush(Gdiplus::Color(130, 130, 130));
-        Gdiplus::StringFormat sf;
-        sf.SetAlignment(Gdiplus::StringAlignmentCenter);
-        sf.SetLineAlignment(Gdiplus::StringAlignmentCenter);
-        Gdiplus::RectF rc((float)IMG_X, (float)IMG_Y, (float)IMG_W, (float)IMG_H);
-        g.DrawString(L"No Image", -1, &font, rc, &sf, &brush);
-    }
-}
-
-// ===== Process Image (crop + resize) =====
-static void ProcessImage(const std::wstring& path) {
+void ProcessImage(const std::wstring& path) {
     delete g_processedImage;
     g_processedImage = nullptr;
 
+    // Display original in INPUT SOURCE
+    Gdiplus::Bitmap original(path.c_str());
+    if (original.GetLastStatus() == Gdiplus::Ok)
+        LoadTextureFromGdiplus(&original, g_pd3dDevice, &g_pTextureView, &g_imgWidth, &g_imgHeight);
+
+    // Crop+resize for OCR engine
     int origW, origH, cropW, cropH, outW, outH;
     g_processedImage = CropAndResize(path, origW, origH, cropW, cropH, outW, outH);
+}
 
-    if (g_processedImage) {
-        wchar_t info[256];
-        swprintf(info, 256, L"  %dx%d -> crop %dx%d -> resize %dx%d",
-                 origW, origH, cropW, cropH, outW, outH);
-        SetWindowTextW(g_hImageInfo, info);
-    } else {
-        SetWindowTextW(g_hImageInfo, L"  Failed to process image");
+void SetupImGuiStyle() {
+    ImGuiStyle& style = ImGui::GetStyle();
+    ImVec4* colors = style.Colors;
+
+    // Cyberpunk neon theme - deep black + cyan/magenta neon
+    colors[ImGuiCol_Text]                   = ImVec4(0.00f, 0.90f, 0.88f, 1.00f); // Cyan text
+    colors[ImGuiCol_TextDisabled]           = ImVec4(0.35f, 0.35f, 0.40f, 1.00f);
+    colors[ImGuiCol_WindowBg]               = ImVec4(0.04f, 0.04f, 0.08f, 1.00f); // Near black
+    colors[ImGuiCol_ChildBg]                = ImVec4(0.06f, 0.06f, 0.10f, 1.00f);
+    colors[ImGuiCol_PopupBg]                = ImVec4(0.05f, 0.05f, 0.08f, 0.96f);
+    colors[ImGuiCol_Border]                 = ImVec4(0.00f, 0.70f, 0.68f, 0.40f); // Cyan border
+    colors[ImGuiCol_BorderShadow]           = ImVec4(0.00f, 0.30f, 0.30f, 0.15f);
+    colors[ImGuiCol_FrameBg]                = ImVec4(0.08f, 0.08f, 0.14f, 1.00f);
+    colors[ImGuiCol_FrameBgHovered]         = ImVec4(0.12f, 0.12f, 0.20f, 1.00f);
+    colors[ImGuiCol_FrameBgActive]          = ImVec4(0.16f, 0.16f, 0.25f, 1.00f);
+    colors[ImGuiCol_TitleBg]                = ImVec4(0.04f, 0.04f, 0.08f, 1.00f);
+    colors[ImGuiCol_TitleBgActive]          = ImVec4(0.06f, 0.06f, 0.12f, 1.00f);
+    colors[ImGuiCol_TitleBgCollapsed]       = ImVec4(0.03f, 0.03f, 0.06f, 1.00f);
+    colors[ImGuiCol_MenuBarBg]              = ImVec4(0.06f, 0.06f, 0.10f, 1.00f);
+    colors[ImGuiCol_ScrollbarBg]            = ImVec4(0.03f, 0.03f, 0.06f, 0.60f);
+    colors[ImGuiCol_ScrollbarGrab]          = ImVec4(0.00f, 0.50f, 0.48f, 0.60f);
+    colors[ImGuiCol_ScrollbarGrabHovered]   = ImVec4(0.00f, 0.70f, 0.68f, 0.80f);
+    colors[ImGuiCol_ScrollbarGrabActive]    = ImVec4(0.00f, 0.90f, 0.88f, 1.00f);
+    colors[ImGuiCol_CheckMark]              = ImVec4(0.00f, 1.00f, 0.98f, 1.00f);
+    colors[ImGuiCol_SliderGrab]             = ImVec4(0.00f, 0.60f, 0.58f, 1.00f);
+    colors[ImGuiCol_SliderGrabActive]       = ImVec4(0.00f, 1.00f, 0.98f, 1.00f);
+    colors[ImGuiCol_Button]                 = ImVec4(0.10f, 0.10f, 0.18f, 1.00f);
+    colors[ImGuiCol_ButtonHovered]          = ImVec4(0.00f, 0.80f, 0.78f, 0.50f); // Cyan glow hover
+    colors[ImGuiCol_ButtonActive]           = ImVec4(0.90f, 0.10f, 0.50f, 0.90f); // Magenta active
+    colors[ImGuiCol_Header]                 = ImVec4(0.10f, 0.10f, 0.18f, 1.00f);
+    colors[ImGuiCol_HeaderHovered]          = ImVec4(0.00f, 0.70f, 0.68f, 0.50f);
+    colors[ImGuiCol_HeaderActive]           = ImVec4(0.00f, 0.90f, 0.88f, 0.70f);
+    colors[ImGuiCol_Separator]              = ImVec4(0.00f, 0.50f, 0.48f, 0.40f); // Cyan separator
+    colors[ImGuiCol_SeparatorHovered]       = ImVec4(0.90f, 0.10f, 0.50f, 0.70f);
+    colors[ImGuiCol_SeparatorActive]        = ImVec4(0.90f, 0.10f, 0.50f, 1.00f);
+    colors[ImGuiCol_ResizeGrip]             = ImVec4(0.00f, 0.50f, 0.48f, 0.40f);
+    colors[ImGuiCol_ResizeGripHovered]      = ImVec4(0.00f, 0.90f, 0.88f, 0.70f);
+    colors[ImGuiCol_ResizeGripActive]       = ImVec4(0.90f, 0.10f, 0.50f, 1.00f);
+    colors[ImGuiCol_Tab]                    = ImVec4(0.08f, 0.08f, 0.14f, 1.00f);
+    colors[ImGuiCol_TabHovered]             = ImVec4(0.90f, 0.10f, 0.50f, 0.60f);
+    colors[ImGuiCol_TabActive]              = ImVec4(0.12f, 0.12f, 0.20f, 1.00f);
+    colors[ImGuiCol_TabUnfocused]           = ImVec4(0.06f, 0.06f, 0.10f, 1.00f);
+    colors[ImGuiCol_TabUnfocusedActive]     = ImVec4(0.08f, 0.08f, 0.14f, 1.00f);
+
+    style.WindowRounding    = 0.0f;  // Sharp edges = cyberpunk
+    style.ChildRounding     = 2.0f;
+    style.FrameRounding     = 2.0f;
+    style.PopupRounding     = 2.0f;
+    style.ScrollbarRounding = 0.0f;
+    style.GrabRounding      = 0.0f;
+    style.TabRounding       = 0.0f;
+    style.WindowBorderSize  = 1.0f;
+    style.ChildBorderSize   = 1.0f;
+    style.FrameBorderSize   = 1.0f;
+    style.ItemSpacing       = ImVec2(12, 8);
+    style.FramePadding      = ImVec2(10, 6);
+}
+
+int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPWSTR lpCmdLine, int nCmdShow) {
+    // GDI+ Init for image processing
+    Gdiplus::GdiplusStartupInput gdiplusStartupInput;
+    ULONG_PTR gdiplusToken;
+    Gdiplus::GdiplusStartup(&gdiplusToken, &gdiplusStartupInput, nullptr);
+
+    WNDCLASSEXW wc = { sizeof(wc), CS_CLASSDC, WndProc, 0L, 0L, hInstance, nullptr, nullptr, nullptr, nullptr, L"ImGui OCR", nullptr };
+    ::RegisterClassExW(&wc);
+    HWND hwnd = ::CreateWindowW(wc.lpszClassName, L"LABEL OCR 1.0", WS_POPUP | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX, 100, 100, 1200, 800, nullptr, nullptr, wc.hInstance, nullptr);
+
+    // Dark title bar / window frame
+    BOOL darkMode = TRUE;
+    DwmSetWindowAttribute(hwnd, 20 /*DWMWA_USE_IMMERSIVE_DARK_MODE*/, &darkMode, sizeof(darkMode));
+
+    if (!CreateDeviceD3D(hwnd)) {
+        CleanupDeviceD3D();
+        ::UnregisterClassW(wc.lpszClassName, wc.hInstance);
+        return 1;
     }
-}
 
-// ===== Create Controls =====
-static void CreateControls(HWND hWnd) {
-    g_hFont = CreateFontW(15, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
-        0, 0, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
-    g_hFontBold = CreateFontW(15, 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET,
-        0, 0, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, L"Segoe UI");
+    ::ShowWindow(hwnd, nCmdShow);
+    ::UpdateWindow(hwnd);
 
-    auto MK = [&](const wchar_t* cls, const wchar_t* txt, DWORD style,
-                   int x, int y, int w, int h, int id, bool bold = false) -> HWND {
-        HWND hw = CreateWindowExW(0, cls, txt, WS_CHILD | WS_VISIBLE | style,
-            x, y, w, h, hWnd, (HMENU)(INT_PTR)id, nullptr, nullptr);
-        SendMessage(hw, WM_SETFONT, (WPARAM)(bold ? g_hFontBold : g_hFont), TRUE);
-        return hw;
-    };
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGuiIO& io = ImGui::GetIO(); (void)io;
+    
+    // Load font - Consolas Bold for cyberpunk terminal feel
+    ImFontConfig font_cfg;
+    font_cfg.OversampleH = 3;
+    font_cfg.OversampleV = 2;
+    font_cfg.RasterizerDensity = 1.5f;
+    io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\consolab.ttf", 18.0f, &font_cfg, io.Fonts->GetGlyphRangesDefault());
 
-    int x = CTL_X, y = 15;
+    SetupImGuiStyle();
 
-    MK(L"STATIC", APP_TITLE, SS_LEFT, 15, 15, 300, 25, 0, true);
+    ImGui_ImplWin32_Init(hwnd);
+    ImGui_ImplDX11_Init(g_pd3dDevice, g_pd3dDeviceContext);
 
-    // Model
-    g_hModelLoad = MK(L"BUTTON", L"Load Model", BS_PUSHBUTTON, x, y, 130, 33, IDC_MODEL_LOAD, true);
-    g_hModelStatus = MK(L"STATIC", L"  Not Loaded", SS_LEFT | SS_CENTERIMAGE,
-        x + 140, y, 340, 33, IDC_MODEL_STATUS);
-    y += 50;
+    ImVec4 clear_color = ImVec4(0.05f, 0.05f, 0.07f, 1.00f);
 
-    // Image
-    MK(L"STATIC", L"Image (auto crop + bilinear resize)", SS_LEFT, x, y, 400, 20, 0);
-    y += 22;
-    g_hImagePath = MK(L"EDIT", L"", ES_AUTOHSCROLL | ES_READONLY | WS_BORDER,
-        x, y, 400, 25, IDC_IMAGE_PATH);
-    g_hImageBrowse = MK(L"BUTTON", L"Browse", BS_PUSHBUTTON, x + 408, y, 70, 25, IDC_IMAGE_BROWSE);
-    y += 28;
-    g_hImageInfo = MK(L"STATIC", L"", SS_LEFT, x, y, 480, 20, IDC_IMAGE_INFO);
-    y += 30;
+    bool done = false;
+    while (!done) {
+        MSG msg;
+        while (::PeekMessage(&msg, nullptr, 0U, 0U, PM_REMOVE)) {
+            ::TranslateMessage(&msg);
+            ::DispatchMessage(&msg);
+            if (msg.message == WM_QUIT) done = true;
+        }
+        if (done) break;
 
-    // OCR
-    g_hOcrBtn = MK(L"BUTTON", L"OCR", BS_PUSHBUTTON, x, y, 130, 40, IDC_OCR_BTN, true);
-    EnableWindow(g_hOcrBtn, FALSE);
-    g_hOcrTime = MK(L"STATIC", L"", SS_LEFT | SS_CENTERIMAGE, x + 140, y, 340, 40, IDC_OCR_TIME);
-    y += 55;
+        // Yield CPU/GPU resources so the OCR engine (CUDA/CPU) isn't starved.
+        if (g_isOcrRunning || g_isModelLoading) {
+            // Throttle GUI to ~15 FPS during heavy processing
+            std::this_thread::sleep_for(std::chrono::milliseconds(60));
+        } else {
+            // Tiny sleep to prevent 100% single-core usage if VSync is disabled or missed
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
 
-    // Result
-    MK(L"STATIC", L"OCR Result", SS_LEFT, x, y, 200, 20, 0);
-    y += 22;
-    g_hResult = MK(L"EDIT", L"",
-        ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL | WS_BORDER,
-        x, y, 510, WIN_H - y - 20, IDC_RESULT);
-}
+        ImGui_ImplDX11_NewFrame();
+        ImGui_ImplWin32_NewFrame();
+        ImGui::NewFrame();
 
-static void UpdateOcrButton() {
-    EnableWindow(g_hOcrBtn, g_modelLoaded && g_processedImage != nullptr);
-}
+        // Main Dashboard Window taking full screen
+        ImGui::SetNextWindowPos(ImVec2(0, 0));
+        ImGui::SetNextWindowSize(io.DisplaySize);
+        ImGui::Begin("Dashboard", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoBringToFrontOnFocus);
 
-// ===== Window Procedure =====
-static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-    switch (msg) {
-    case WM_CREATE:
-        CreateControls(hWnd);
-        return 0;
+        // Custom Title Bar
+        ImGui::SetCursorPos(ImVec2(10, 10));
+        ImGui::TextColored(ImVec4(0.00f, 1.0f, 0.98f, 1.0f), "[ LABEL OCR 1.0 ]");
+        ImGui::SameLine(ImGui::GetWindowWidth() - 40);
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.0f, 0.0f, 0.0f, 0.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.9f, 0.2f, 0.2f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(1.0f, 0.3f, 0.3f, 1.0f));
+        if (ImGui::Button("X", ImVec2(30, 24))) {
+            ::PostMessage(hwnd, WM_CLOSE, 0, 0);
+        }
+        ImGui::PopStyleColor(3);
+        ImGui::Separator();
+        ImGui::Spacing();
 
-    case WM_PAINT: {
-        PAINTSTRUCT ps;
-        HDC hdc = BeginPaint(hWnd, &ps);
-        DrawPreview(hdc);
-        EndPaint(hWnd, &ps);
-        return 0;
-    }
+        float topH = io.DisplaySize.y * 0.45f;
 
-    case WM_COMMAND:
-        switch (LOWORD(wParam)) {
-        case IDC_IMAGE_BROWSE: {
-            auto path = BrowseImage(hWnd);
+        // ===== Top Row: INPUT SOURCE | SYSTEM CONTROLS =====
+        // Left: Image Preview
+        ImGui::BeginChild("ImagePanel", ImVec2(ImGui::GetContentRegionAvail().x * 0.5f, topH), true);
+        ImGui::TextColored(ImVec4(0.90f, 0.10f, 0.50f, 1.0f), ">> INPUT SOURCE");
+        ImGui::Separator();
+        ImGui::Spacing();
+
+        if (g_pTextureView) {
+            float availW = ImGui::GetContentRegionAvail().x;
+            float availH = ImGui::GetContentRegionAvail().y;
+            float aspect = (float)g_imgWidth / (float)g_imgHeight;
+            float drawW = availW;
+            float drawH = availW / aspect;
+            if (drawH > availH) { drawH = availH; drawW = availH * aspect; }
+            ImGui::Image((void*)g_pTextureView, ImVec2(drawW, drawH));
+        } else {
+            ImGui::TextColored(ImVec4(0.35f, 0.35f, 0.40f, 1.0f), "[ NO SIGNAL ]");
+        }
+        ImGui::EndChild();
+
+        ImGui::SameLine();
+
+        // Right: System Controls
+        ImGui::BeginChild("ControlPanel", ImVec2(0, topH), true);
+        ImGui::TextColored(ImVec4(0.90f, 0.10f, 0.50f, 1.0f), ">> SYSTEM CONTROLS");
+        ImGui::Separator();
+        ImGui::Spacing();
+
+        // Model Load
+        bool canLoad = !g_isModelLoading && !g_isOcrRunning;
+        if (!canLoad) {
+            ImGui::PushItemFlag(ImGuiItemFlags_Disabled, true);
+            ImGui::PushStyleVar(ImGuiStyleVar_Alpha, 0.5f);
+        }
+        if (ImGui::Button("INIT MODEL", ImVec2(180, 40))) {
+            g_isModelLoading = true;
+            std::thread([]() {
+                std::string res = OcrLoadModel();
+                std::lock_guard<std::mutex> lock(g_stateMutex);
+                if (res.empty()) g_ocrResult = "Model Loaded successfully.";
+                else g_ocrResult = "Error: " + res;
+                g_isModelLoading = false;
+            }).detach();
+        }
+        if (!canLoad) { ImGui::PopItemFlag(); ImGui::PopStyleVar(); }
+        ImGui::SameLine();
+        ImGui::AlignTextToFramePadding();
+        if (g_modelLoaded) ImGui::TextColored(ImVec4(0.0f, 1.0f, 0.0f, 1.0f), "ONLINE");
+        else ImGui::TextColored(ImVec4(1.0f, 0.0f, 0.0f, 1.0f), "OFFLINE");
+
+        ImGui::Spacing();
+
+        // Image Selection
+        if (ImGui::Button("BROWSE IMAGE", ImVec2(180, 40))) {
+            std::wstring path = BrowseImage(hwnd);
             if (!path.empty()) {
                 g_imagePath = path;
-                SetWindowTextW(g_hImagePath, path.c_str());
-                SetWindowTextW(g_hImageInfo, L"  Processing...");
+                g_imagePathStr = WideToUtf8(path);
                 ProcessImage(path);
-                InvalidateRect(hWnd, nullptr, TRUE);
-                UpdateOcrButton();
             }
-            break;
         }
-        case IDC_MODEL_LOAD: {
-            EnableWindow(g_hModelLoad, FALSE);
-            SetWindowTextW(g_hModelStatus, L"  Loading...");
-            std::thread(ModelLoadThread).detach();
-            break;
-        }
-        case IDC_OCR_BTN: {
-            if (!g_modelLoaded || !g_processedImage) break;
-            EnableWindow(g_hOcrBtn, FALSE);
-            SetWindowTextW(g_hOcrBtn, L"Processing...");
-            SetWindowTextW(g_hOcrTime, L"");
-            SetWindowTextW(g_hResult, L"");
-            std::thread(OcrThread).detach();
-            break;
-        }
-        }
-        return 0;
+        ImGui::SameLine();
+        ImGui::TextWrapped("%s", g_imagePathStr.empty() ? "No file" : g_imagePathStr.c_str());
 
-    case WM_MODEL_READY:
-        g_modelLoaded = true;
-        SetWindowTextW(g_hModelStatus, L"  Ready");
-        EnableWindow(g_hModelLoad, TRUE);
-        UpdateOcrButton();
-        return 0;
+        ImGui::Spacing();
 
-    case WM_MODEL_FAIL:
-        SetWindowTextW(g_hModelStatus, Utf8ToWide("  FAIL: " + g_ocrResult).c_str());
-        EnableWindow(g_hModelLoad, TRUE);
-        return 0;
-
-    case WM_OCR_DONE: {
-        std::wstring result = Utf8ToWide(g_ocrResult);
-        std::wstring display;
-        for (wchar_t c : result) {
-            if (c == L'\n') display += L"\r\n";
-            else display += c;
+        // OCR Action
+        bool canOcr = g_modelLoaded && g_processedImage && !g_isOcrRunning && !g_isModelLoading;
+        if (!canOcr) {
+            ImGui::PushItemFlag(ImGuiItemFlags_Disabled, true);
+            ImGui::PushStyleVar(ImGuiStyleVar_Alpha, 0.5f);
         }
-        SetWindowTextW(g_hResult, display.c_str());
-        wchar_t timeBuf[64];
-        swprintf(timeBuf, 64, L"  %.2f sec", g_ocrElapsed);
-        SetWindowTextW(g_hOcrTime, timeBuf);
-        SetWindowTextW(g_hOcrBtn, L"OCR");
-        EnableWindow(g_hOcrBtn, TRUE);
-        return 0;
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.9f, 0.16f, 0.55f, 0.8f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(1.0f, 0.2f, 0.6f, 1.0f));
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.8f, 0.1f, 0.5f, 1.0f));
+        if (ImGui::Button("RUN EXTRACTION", ImVec2(ImGui::GetContentRegionAvail().x, 50))) {
+            g_isOcrRunning = true;
+            g_ocrResult = "Processing...";
+            std::thread([]() {
+                double elapsed = 0;
+                std::string res = OcrRunInference(g_processedImage, elapsed);
+                std::lock_guard<std::mutex> lock(g_stateMutex);
+                g_ocrElapsed = elapsed;
+                g_ocrResult = res.empty() ? "No output generated" : res;
+                g_isOcrRunning = false;
+            }).detach();
+        }
+        ImGui::PopStyleColor(3);
+        if (!canOcr) { ImGui::PopItemFlag(); ImGui::PopStyleVar(); }
+
+        if (g_ocrElapsed > 0) {
+            ImGui::TextColored(ImVec4(0.9f, 0.16f, 0.55f, 1.0f), "Time: %.2f sec", g_ocrElapsed);
+        }
+        ImGui::EndChild();
+
+        ImGui::Spacing();
+
+        // ===== Bottom: OUTPUT DATA (full width) =====
+        ImGui::BeginChild("OutputPanel", ImVec2(0, 0), true);
+        ImGui::TextColored(ImVec4(0.90f, 0.10f, 0.50f, 1.0f), ">> OUTPUT DATA");
+        ImGui::Separator();
+
+        std::string resultCopy;
+        {
+            std::lock_guard<std::mutex> lock(g_stateMutex);
+            resultCopy = g_ocrResult;
+        }
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.92f, 0.94f, 0.96f, 1.0f));
+        ImGui::InputTextMultiline("##Result", &resultCopy[0], resultCopy.size() + 1,
+            ImVec2(-FLT_MIN, ImGui::GetContentRegionAvail().y), ImGuiInputTextFlags_ReadOnly);
+        ImGui::PopStyleColor();
+
+        ImGui::EndChild();
+
+        ImGui::End();
+
+        // Render
+        ImGui::Render();
+        const float clear_color_with_alpha[4] = { clear_color.x * clear_color.w, clear_color.y * clear_color.w, clear_color.z * clear_color.w, clear_color.w };
+        g_pd3dDeviceContext->OMSetRenderTargets(1, &g_mainRenderTargetView, nullptr);
+        g_pd3dDeviceContext->ClearRenderTargetView(g_mainRenderTargetView, clear_color_with_alpha);
+        ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
+
+        g_pSwapChain->Present(1, 0); // Present with vsync
     }
 
-    case WM_OCR_FAIL:
-        SetWindowTextW(g_hResult, Utf8ToWide(g_ocrResult).c_str());
-        SetWindowTextW(g_hOcrBtn, L"OCR");
-        EnableWindow(g_hOcrBtn, TRUE);
-        return 0;
+    // Cleanup
+    ImGui_ImplDX11_Shutdown();
+    ImGui_ImplWin32_Shutdown();
+    ImGui::DestroyContext();
 
-    case WM_CLOSE:
-        FreeModel();
-        DestroyWindow(hWnd);
-        return 0;
+    OcrFreeModel();
+    if (g_pTextureView) { g_pTextureView->Release(); g_pTextureView = nullptr; }
+    delete g_processedImage; g_processedImage = nullptr;
 
-    case WM_DESTROY:
-        delete g_processedImage;
-        g_processedImage = nullptr;
-        DeleteObject(g_hFont);
-        DeleteObject(g_hFontBold);
-        PostQuitMessage(0);
-        return 0;
-    }
-    return DefWindowProcW(hWnd, msg, wParam, lParam);
+    CleanupDeviceD3D();
+    ::DestroyWindow(hwnd);
+    ::UnregisterClassW(wc.lpszClassName, wc.hInstance);
+
+    Gdiplus::GdiplusShutdown(gdiplusToken);
+
+    return 0;
 }
 
-// ===== WinMain =====
-int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int nCmdShow) {
-    CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+// DX11 Boilerplate
+bool CreateDeviceD3D(HWND hWnd) {
+    DXGI_SWAP_CHAIN_DESC sd;
+    ZeroMemory(&sd, sizeof(sd));
+    sd.BufferCount = 2;
+    sd.BufferDesc.Width = 0;
+    sd.BufferDesc.Height = 0;
+    sd.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    sd.BufferDesc.RefreshRate.Numerator = 60;
+    sd.BufferDesc.RefreshRate.Denominator = 1;
+    sd.Flags = DXGI_SWAP_CHAIN_FLAG_ALLOW_MODE_SWITCH;
+    sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+    sd.OutputWindow = hWnd;
+    sd.SampleDesc.Count = 1;
+    sd.SampleDesc.Quality = 0;
+    sd.Windowed = TRUE;
+    sd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
 
-    Gdiplus::GdiplusStartupInput gdipInput;
-    ULONG_PTR gdipToken;
-    Gdiplus::GdiplusStartup(&gdipToken, &gdipInput, nullptr);
+    UINT createDeviceFlags = 0;
+    D3D_FEATURE_LEVEL featureLevel;
+    const D3D_FEATURE_LEVEL featureLevelArray[2] = { D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_0, };
+    if (D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, createDeviceFlags, featureLevelArray, 2, D3D11_SDK_VERSION, &sd, &g_pSwapChain, &g_pd3dDevice, &featureLevel, &g_pd3dDeviceContext) != S_OK)
+        return false;
 
-    INITCOMMONCONTROLSEX icc = { sizeof(icc), ICC_STANDARD_CLASSES };
-    InitCommonControlsEx(&icc);
+    CreateRenderTarget();
+    return true;
+}
 
-    WNDCLASSEXW wc = { sizeof(wc) };
-    wc.style = CS_HREDRAW | CS_VREDRAW;
-    wc.lpfnWndProc = WndProc;
-    wc.hInstance = hInst;
-    wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
-    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
-    wc.lpszClassName = L"QwenOCRClass";
-    wc.hIcon = LoadIcon(nullptr, IDI_APPLICATION);
-    RegisterClassExW(&wc);
+void CleanupDeviceD3D() {
+    CleanupRenderTarget();
+    if (g_pSwapChain) { g_pSwapChain->Release(); g_pSwapChain = nullptr; }
+    if (g_pd3dDeviceContext) { g_pd3dDeviceContext->Release(); g_pd3dDeviceContext = nullptr; }
+    if (g_pd3dDevice) { g_pd3dDevice->Release(); g_pd3dDevice = nullptr; }
+}
 
-    RECT rc = { 0, 0, WIN_W, WIN_H };
-    AdjustWindowRect(&rc, WS_OVERLAPPEDWINDOW, FALSE);
-    g_hWnd = CreateWindowExW(0, wc.lpszClassName, APP_TITLE,
-        WS_OVERLAPPEDWINDOW & ~WS_THICKFRAME & ~WS_MAXIMIZEBOX,
-        CW_USEDEFAULT, CW_USEDEFAULT, rc.right - rc.left, rc.bottom - rc.top,
-        nullptr, nullptr, hInst, nullptr);
+void CreateRenderTarget() {
+    ID3D11Texture2D* pBackBuffer;
+    g_pSwapChain->GetBuffer(0, IID_PPV_ARGS(&pBackBuffer));
+    g_pd3dDevice->CreateRenderTargetView(pBackBuffer, nullptr, &g_mainRenderTargetView);
+    pBackBuffer->Release();
+}
 
-    ShowWindow(g_hWnd, nCmdShow);
-    UpdateWindow(g_hWnd);
+void CleanupRenderTarget() {
+    if (g_mainRenderTargetView) { g_mainRenderTargetView->Release(); g_mainRenderTargetView = nullptr; }
+}
 
-    MSG msg;
-    while (GetMessage(&msg, nullptr, 0, 0)) {
-        TranslateMessage(&msg);
-        DispatchMessage(&msg);
+extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
+LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    if (ImGui_ImplWin32_WndProcHandler(hWnd, msg, wParam, lParam))
+        return true;
+
+    switch (msg) {
+    case WM_NCHITTEST: {
+        LRESULT hit = ::DefWindowProcW(hWnd, msg, wParam, lParam);
+        if (hit == HTCLIENT) {
+            POINT pt;
+            pt.x = (short)LOWORD(lParam);
+            pt.y = (short)HIWORD(lParam);
+            ::ScreenToClient(hWnd, &pt);
+            RECT rc;
+            ::GetClientRect(hWnd, &rc);
+            // Allow dragging from the top 40 pixels (excluding the close button area on the right)
+            if (pt.y >= 0 && pt.y < 40 && pt.x >= 0 && pt.x < rc.right - 50) {
+                return HTCAPTION;
+            }
+        }
+        return hit;
     }
-
-    Gdiplus::GdiplusShutdown(gdipToken);
-    CoUninitialize();
-    return (int)msg.wParam;
+    case WM_SIZE:
+        if (g_pd3dDevice != nullptr && wParam != SIZE_MINIMIZED) {
+            CleanupRenderTarget();
+            g_pSwapChain->ResizeBuffers(0, (UINT)LOWORD(lParam), (UINT)HIWORD(lParam), DXGI_FORMAT_UNKNOWN, 0);
+            CreateRenderTarget();
+        }
+        return 0;
+    case WM_SYSCOMMAND:
+        if ((wParam & 0xfff0) == SC_KEYMENU)
+            return 0;
+        break;
+    case WM_DESTROY:
+        ::PostQuitMessage(0);
+        return 0;
+    }
+    return ::DefWindowProcW(hWnd, msg, wParam, lParam);
 }

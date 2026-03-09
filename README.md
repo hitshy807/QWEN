@@ -26,3 +26,6 @@ Then run `exe\qwen_ocr.exe`.
 - CUDA Toolkit (12.x / 13.x)
 - Visual Studio 2022+ (C++ Desktop workload)
 - CMake + Ninja
+- Git
+- curl (Windows 10+ built-in)
+- Internet connection (~2 GB download)

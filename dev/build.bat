@@ -22,6 +22,7 @@ cl /EHsc /O2 /DUNICODE /D_UNICODE /std:c++17 ^
 
 if %ERRORLEVEL%==0 (
     echo.
+    copy /Y qwen_ocr.exe.manifest "..\exe\" >nul 2>&1
     echo [OK] Build successful: ..\exe\qwen_ocr.exe
     del *.obj 2>nul
 ) else (
